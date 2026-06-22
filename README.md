@@ -110,6 +110,7 @@ Other entry points (same vendored contract + local stack):
 ```bash
 pnpm hidden-burn      # mint via contract, then burn outside it (amount stays hidden)
 pnpm verify-supply    # the supply-auditability scenario (5 steps, PASS/FAIL matrix)
+pnpm mint-to-contract # mint token A straight to a recipient contract B (expected to fail)
 ```
 
 If testkit's container log-wait is flaky in your environment (it can report
@@ -119,6 +120,7 @@ self-managed variants instead, which bring the stack up with plain `docker compo
 ```bash
 bash scripts/run-hidden-burn.sh      # -> pnpm hidden-burn
 bash scripts/run-verify-supply.sh    # -> pnpm verify-supply
+bash scripts/run-mint-to-contract.sh # -> pnpm mint-to-contract
 ```
 
 The first run pulls the Docker images (a few minutes). A full run takes roughly
@@ -146,6 +148,7 @@ byte sizes are roughly stable.) A committed example of the generated report is i
 | `INDEXER-VIEW.md` | Per-tx public view + a public-vs-hidden summary | `reproduce` |
 | `HIDDEN-BURN-VIEW.md` | The direct (amount-hidden) burn, decoded | `hidden-burn` |
 | `SUPPLY-AUDIT.md` | Supply PASS/FAIL matrix + per-tx delta fold + protocol-burn finding | `verify-supply` |
+| `MINT-TO-CONTRACT.md` | Mint-to-contract PASS/FAIL verdict + node reject reason | `mint-to-contract` |
 | `<n>-<kind>.hex` | The exact raw bytes submitted on-chain (deploy/mint/burn/hidden-burn/protocol-burn) | all |
 | `*.decode.txt` | Full structured decode of each tx (transcript effects, Zswap offers, ledger dump) | all |
 
@@ -241,6 +244,36 @@ Pedersen commitment (hidden, like any user-to-user transfer). The trade-off is
 that the contract can no longer see or count it. `src/hidden-burn.ts` runs
 exactly that and decodes the result; see [`out/HIDDEN-BURN-VIEW.md`](./out/HIDDEN-BURN-VIEW.md).
 
+## Experiment: can you mint a shielded token straight to a contract?
+
+Short answer: **no.** A mint whose recipient is a *contract address* (not a
+wallet coin public key) is **rejected by the node** unless that contract
+*receives* the coin in the same transaction.
+
+`pnpm mint-to-contract` deploys two `ShieldedFungibleToken` contracts — **A**
+(the token) and **B** (the intended recipient) — and calls `A.mint()` with the
+recipient `Either<ZswapCoinPublicKey, ContractAddress>` set to the ContractAddress
+(right) variant = B's address:
+
+| tx | result |
+|---|---|
+| deploy A | accepted |
+| deploy B | accepted |
+| mint A → B | built + proven OK, then **rejected at submission**: `1010: Invalid Transaction: Custom error: 186` |
+
+The decoded mint tx (`out/mtc-3-mint.decode.txt`) shows why: the mint creates a
+shielded output `for: ContractAddress(B)`, but `claimed_shielded_receives` is
+empty and B is never called. A coin owned by a contract has to be taken into
+custody by that contract (a `receiveShielded`, i.e. a claimed shielded receive) in
+the *same* transaction. An orphaned contract-owned output is invalid, so the
+ledger refuses the whole transaction. A mint to a *wallet* coin public key has no
+such rule: users claim coins by scanning, contracts must actively receive.
+
+**Conclusion.** You cannot push a shielded token into a contract by minting to its
+address. To fund contract B, B has to receive it: a cross-contract call where B
+runs `receiveShielded` in the same tx, or a mint-to-wallet followed by a transfer
+that B receives. Full write-up: [`SAMPLE-MINT-TO-CONTRACT.md`](./SAMPLE-MINT-TO-CONTRACT.md).
+
 ## How it works
 
 | File | Role |
@@ -248,9 +281,11 @@ exactly that and decodes the result; see [`out/HIDDEN-BURN-VIEW.md`](./out/HIDDE
 | `src/reproduce.ts` | Orchestrator: start local stack → wallet → deploy → mint → burn → decode → report |
 | `src/hidden-burn.ts` | Variant orchestrator: mint via the contract, then burn by a direct wallet → burn-address transfer (amount stays hidden). Decodes to `out/HIDDEN-BURN-VIEW.md` |
 | `src/verify-supply.ts` | Supply-audit orchestrator: deploy → mint → contract burn → hidden burn → protocol burn; per-step PASS/FAIL matrix to `out/SUPPLY-AUDIT.md` |
+| `src/mint-to-contract.ts` | Mint-to-contract experiment: deploy A + B, then `A.mint()` to B's contract address; captures the node's accept/reject to `out/MINT-TO-CONTRACT.md` |
 | `src/supply.ts` | Pure delta-fold: `deltaForType`, `shieldedMintsForType`, `foldSupply` over decoded txs (also a CLI for offline folding of captured `.hex`) |
 | `scripts/run-hidden-burn.sh` | Brings the `compose.yml` stack up with plain `docker compose`, injects ports, runs `hidden-burn` (avoids testkit's flaky log-wait) |
 | `scripts/run-verify-supply.sh` | Same self-managed-stack wrapper, for `verify-supply` |
+| `scripts/run-mint-to-contract.sh` | Same self-managed-stack wrapper, for `mint-to-contract` |
 | `src/wallet-provider.ts` | `WalletProvider`/`MidnightProvider` (balance + submit); captures each submitted tx's raw bytes |
 | `src/providers.ts` | Assembles the midnight-js providers (indexer, proof, zk-config, private-state) |
 | `src/contract.ts` | Deploy / join / mint / burn + `totalSupply()` read against the vendored contract |

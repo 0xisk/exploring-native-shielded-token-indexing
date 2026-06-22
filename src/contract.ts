@@ -39,6 +39,15 @@ const recipientForCoinPublicKey = (coinPublicKey: CoinPublicKey) => ({
 	right: { bytes: new Uint8Array(32) },
 });
 
+/** Build the same Either, but selecting the ContractAddress (right) variant. */
+const recipientForContractAddress = (contractAddressHex: string) => ({
+	is_left: false,
+	left: { bytes: new Uint8Array(32) },
+	right: {
+		bytes: Uint8Array.from(Buffer.from(contractAddressHex.replace(/^0x/, ""), "hex")),
+	},
+});
+
 export class ShieldedFungibleToken {
 	private constructor(
 		private readonly deployedContract: any,
@@ -97,6 +106,24 @@ export class ShieldedFungibleToken {
 		const coin: ShieldedCoinInfo = txData.private.result; // { nonce, color, value }
 		this.logger.info(
 			`Minted: color=${bytesToHex(coin.color)} value=${coin.value} (tx ${txData.public.txHash})`,
+		);
+		return coin;
+	}
+
+	/**
+	 * Mint `amount` directly to a *contract* address. The recipient Either selects
+	 * the ContractAddress (right) variant instead of a coin public key, so the
+	 * minted coin is owned by contract `contractAddressHex` rather than a wallet.
+	 */
+	async mintToContract(contractAddressHex: string, amount: bigint): Promise<ShieldedCoinInfo> {
+		this.logger.info(`Minting ${amount} to contract ${contractAddressHex}...`);
+		const txData = await this.deployedContract.callTx.mint(
+			recipientForContractAddress(contractAddressHex),
+			amount,
+		);
+		const coin: ShieldedCoinInfo = txData.private.result;
+		this.logger.info(
+			`Minted to contract: color=${bytesToHex(coin.color)} value=${coin.value} (tx ${txData.public.txHash})`,
 		);
 		return coin;
 	}

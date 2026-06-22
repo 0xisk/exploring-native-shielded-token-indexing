@@ -84,6 +84,44 @@ All rows verified **PASS** on a live stack. Three findings:
 Output: [`out/SUPPLY-AUDIT.md`](./out/SUPPLY-AUDIT.md) (committed sample:
 [`SAMPLE-SUPPLY-AUDIT.md`](./SAMPLE-SUPPLY-AUDIT.md)).
 
+## Proof: `totalSupply()` can't see an off-circuit burn
+
+A focused, single-claim proof of the ERC20 analogy: in ERC20, `transfer(0x…dead,
+x)` removes `x` from circulation but never moves `totalSupply` (only `burn()`
+does). A shielded token is the same. `pnpm prove-supply-gap` runs one stack
+through deploy → mint `M` → **send `B` to the burn address with a plain wallet
+transfer (no contract call)** and reads the contract's `totalSupply()` before and
+after:
+
+| | contract `totalSupply()` | truly circulating | gap |
+|---|---|---|---|
+| after mint M = 1,000,000 | 1,000,000 | 1,000,000 | 0 |
+| after sending B = 400,000 to burn address | **1,000,000** | 600,000 | **400,000** |
+
+The counter does not move, yet `B` tokens are now provably unspendable. The
+script asserts six facts and writes a PASS/FAIL verdict:
+
+- **A1** `totalSupply()` reads `M` after the mint.
+- **A2** the burn tx makes **0** `ContractCall`s (the contract is never invoked).
+- **A3** `totalSupply()` is **unchanged** after the burn.
+- **A4** the burn's net zswap `delta[tt]` is **0** — the coin stays in the pool as
+  a dead coin, so an indexer's `−Σ deltas` fold is blind to it too.
+- **A5** that fold still reads `M` (both public measures overstate).
+- **A6** the supply gap equals exactly `B`.
+
+**Why the tokens are gone.** The burn address is the all-zero coin public key.
+Spending a coin needs the coin secret key for its coin public key; no secret key
+is known for the zero key, so the coin can never be spent. (The output reuses our
+*encryption* key, which only governs who can detect/decrypt the output, never who
+can spend it — so the wallet still *sees* a coin it can never move.)
+
+**Conclusion: a shielded token's `totalSupply()` is an upper bound on circulating
+supply, not an exact measure.** Output:
+[`out/SUPPLY-GAP-PROOF.md`](./out/SUPPLY-GAP-PROOF.md) (committed sample:
+[`SAMPLE-SUPPLY-GAP-PROOF.md`](./SAMPLE-SUPPLY-GAP-PROOF.md)). Tune with `MINT_AMOUNT`
+(`M`) and `BURN_AMOUNT` (`B`, sent off-circuit; must be ≤ `M`); `SOFT_ASSERT=1`
+keeps the run from exiting non-zero on a failed assertion.
+
 ## Prerequisites
 
 - **Docker** running (the script brings up node + indexer + proof-server as
@@ -110,6 +148,7 @@ Other entry points (same vendored contract + local stack):
 ```bash
 pnpm hidden-burn      # mint via contract, then burn outside it (amount stays hidden)
 pnpm verify-supply    # the supply-auditability scenario (5 steps, PASS/FAIL matrix)
+pnpm prove-supply-gap # proof: totalSupply() can't see an off-circuit burn-address transfer
 ```
 
 If testkit's container log-wait is flaky in your environment (it can report
@@ -119,6 +158,7 @@ self-managed variants instead, which bring the stack up with plain `docker compo
 ```bash
 bash scripts/run-hidden-burn.sh      # -> pnpm hidden-burn
 bash scripts/run-verify-supply.sh    # -> pnpm verify-supply
+bash scripts/run-prove-supply-gap.sh # -> pnpm prove-supply-gap
 ```
 
 The first run pulls the Docker images (a few minutes). A full run takes roughly
@@ -146,7 +186,8 @@ byte sizes are roughly stable.) A committed example of the generated report is i
 | `INDEXER-VIEW.md` | Per-tx public view + a public-vs-hidden summary | `reproduce` |
 | `HIDDEN-BURN-VIEW.md` | The direct (amount-hidden) burn, decoded | `hidden-burn` |
 | `SUPPLY-AUDIT.md` | Supply PASS/FAIL matrix + per-tx delta fold + protocol-burn finding | `verify-supply` |
-| `<n>-<kind>.hex` | The exact raw bytes submitted on-chain (deploy/mint/burn/hidden-burn/protocol-burn) | all |
+| `SUPPLY-GAP-PROOF.md` | Before/after `totalSupply()` + six assertions proving an off-circuit burn is invisible | `prove-supply-gap` |
+| `<n>-<kind>.hex` | The exact raw bytes submitted on-chain (deploy/mint/burn/hidden-burn/protocol-burn/off-circuit-burn) | all |
 | `*.decode.txt` | Full structured decode of each tx (transcript effects, Zswap offers, ledger dump) | all |
 
 Re-decode any captured tx on its own:
@@ -248,9 +289,11 @@ exactly that and decodes the result; see [`out/HIDDEN-BURN-VIEW.md`](./out/HIDDE
 | `src/reproduce.ts` | Orchestrator: start local stack → wallet → deploy → mint → burn → decode → report |
 | `src/hidden-burn.ts` | Variant orchestrator: mint via the contract, then burn by a direct wallet → burn-address transfer (amount stays hidden). Decodes to `out/HIDDEN-BURN-VIEW.md` |
 | `src/verify-supply.ts` | Supply-audit orchestrator: deploy → mint → contract burn → hidden burn → protocol burn; per-step PASS/FAIL matrix to `out/SUPPLY-AUDIT.md` |
+| `src/prove-supply-gap.ts` | Single-claim proof: deploy → mint → off-circuit burn-address transfer; before/after `totalSupply()` + six assertions to `out/SUPPLY-GAP-PROOF.md` |
 | `src/supply.ts` | Pure delta-fold: `deltaForType`, `shieldedMintsForType`, `foldSupply` over decoded txs (also a CLI for offline folding of captured `.hex`) |
 | `scripts/run-hidden-burn.sh` | Brings the `compose.yml` stack up with plain `docker compose`, injects ports, runs `hidden-burn` (avoids testkit's flaky log-wait) |
 | `scripts/run-verify-supply.sh` | Same self-managed-stack wrapper, for `verify-supply` |
+| `scripts/run-prove-supply-gap.sh` | Same self-managed-stack wrapper, for `prove-supply-gap` |
 | `src/wallet-provider.ts` | `WalletProvider`/`MidnightProvider` (balance + submit); captures each submitted tx's raw bytes |
 | `src/providers.ts` | Assembles the midnight-js providers (indexer, proof, zk-config, private-state) |
 | `src/contract.ts` | Deploy / join / mint / burn + `totalSupply()` read against the vendored contract |

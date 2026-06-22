@@ -7,6 +7,7 @@
   "scripts": {
     "reproduce": "tsx src/reproduce.ts",
     "verify-supply": "tsx src/verify-supply.ts",
+    "prove-supply-gap": "tsx src/prove-supply-gap.ts",
     "hidden-burn": "tsx src/hidden-burn.ts",
     "decode": "tsx src/decode.ts",
     "compile": "bash scripts/compile.sh",

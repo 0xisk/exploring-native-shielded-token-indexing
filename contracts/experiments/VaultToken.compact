@@ -1,0 +1,61 @@
+// Deposit experiment (the PASSING case) — NOT part of the token.
+//
+// Experiments mint-to-contract and mint-send-to-contract both failed: a coin
+// addressed to a contract is invalid unless that contract receives it
+// (receiveShielded) in the same transaction. Compact 1.0 has no cross-contract
+// calls (the `contract` keyword is reserved but unimplemented), so A cannot call
+// B in one tx. The wallet bridges instead:
+//
+//   1. A.mint(recipient = wallet)   -> wallet holds the coin (mint to a coin pk)
+//   2. B.deposit(coin)              -> B.receiveShielded() takes it into custody
+//
+// VaultToken provides BOTH circuits so a single compiled artifact serves both
+// roles (A = minter, B = recipient/vault) under one ZK config. A passing
+// B.deposit proves a contract CAN hold token A when it actively receives.
+
+pragma language_version >= 0.23.0;
+import CompactStandardLibrary;
+
+// Public state (token side).
+export ledger _counter: Counter;
+export ledger _nonce: Bytes<32>;
+export sealed ledger _domain: Bytes<32>;
+export ledger _color: Bytes<32>;
+// Vault side: how many coins this contract has received.
+export ledger _deposits: Counter;
+
+constructor(initNonce: Bytes<32>, domain_: Bytes<32>) {
+  _nonce = disclose(initNonce);
+  _domain = disclose(domain_);
+}
+
+circuit isZero(a: Bytes<32>): Boolean {
+  return a == pad(32, '');
+}
+
+export circuit color(): Bytes<32> {
+  return _color;
+}
+
+// Token role: mint a coin to a recipient (here, the wallet's coin public key).
+export circuit mint(
+  recipient: Either<ZswapCoinPublicKey, ContractAddress>,
+  amount: Uint<64>
+): ShieldedCoinInfo {
+  _counter.increment(1);
+  const newNonce = evolveNonce(_counter, _nonce);
+  _nonce = newNonce;
+  const ret = mintShieldedToken(_domain, disclose(amount), _nonce, disclose(recipient));
+  if (isZero(_color)) {
+    _color = ret.color;
+  }
+  return ret;
+}
+
+// Vault role: receive a shielded coin into THIS contract's custody. This is the
+// receive that the failed experiments lacked — it satisfies the ledger rule
+// that a contract-addressed coin must be received in the same transaction.
+export circuit deposit(coin: ShieldedCoinInfo): [] {
+  receiveShielded(disclose(coin));
+  _deposits.increment(1);
+}

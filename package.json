@@ -12,8 +12,12 @@
     "compile": "bash scripts/compile.sh",
     "compile:disclose-probe": "compact compile +0.31.0 --skip-zk contracts/experiments/disclose-probe.compact build/disclose-probe",
     "compile:no-supply": "compact compile +0.31.0 contracts/experiments/NoSupplyToken.compact build/NoSupplyToken",
+    "compile:mint-send": "compact compile +0.31.0 contracts/experiments/MintSendToken.compact build/MintSendToken",
+    "compile:vault": "compact compile +0.31.0 contracts/experiments/VaultToken.compact build/VaultToken",
     "no-supply-burn": "tsx src/no-supply-burn.ts",
     "mint-to-contract": "tsx src/mint-to-contract.ts",
+    "mint-send-to-contract": "tsx src/mint-send-to-contract.ts",
+    "mint-and-deposit": "tsx src/mint-and-deposit.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

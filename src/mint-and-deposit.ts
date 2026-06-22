@@ -1,19 +1,17 @@
-// Experiment: can contract A mint its shielded token directly to *contract B*?
+// Experiment (variant 3, the PASSING case): get token A into contract B by
+// having B *receive* it.
 //
-// Two ShieldedFungibleToken contracts are deployed on one local v8 stack:
-//   A — the token being minted
-//   B — the intended recipient (a contract address, not a wallet coin pk)
-// We then call A.mint() with the recipient Either selecting the ContractAddress
-// (right) variant set to B's address, and submit it. The question is purely
-// empirical: does the node ACCEPT a mint whose output coin is owned by a
-// contract that does not participate in the transaction (no `receiveShielded`)?
+// mint-to-contract and mint-send-to-contract both failed because the recipient
+// contract never ran receiveShielded. Compact 1.0 has no cross-contract calls,
+// so the wallet bridges the two contracts across two transactions:
 //
-//   - if the mint tx is accepted -> EXPERIMENT PASSED (mint-to-contract works)
-//   - if it is rejected at build / prove / submit -> EXPERIMENT FAILED (+ reason)
+//   1. A.mint(recipient = wallet)  -> wallet holds the freshly minted coin
+//   2. B.deposit(coin)             -> B.receiveShielded() takes it into custody
 //
-// Either way we capture and decode every tx so the raw bytes explain the result.
+// A and B are both VaultToken instances (one ZK config, two roles). A passing
+// deposit proves a contract CAN hold token A when it actively receives.
 //
-// Run: tsx src/mint-to-contract.ts   (or bash scripts/run-mint-to-contract.sh)
+// Run: tsx src/mint-and-deposit.ts  (or bash scripts/run-mint-and-deposit.sh)
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -22,17 +20,17 @@ import { setNetworkId } from "@midnight-ntwrk/midnight-js-network-id";
 import { getTestEnvironment, LocalTestConfiguration } from "@midnight-ntwrk/testkit-js";
 import { pino } from "pino";
 import { WebSocket } from "ws";
-import { ShieldedFungibleToken } from "./contract.js";
 import { type DecodedTx, decodeTx, formatDecode } from "./decode.js";
 import { configureProviders } from "./providers.js";
+import { VaultToken } from "./vault-contract.js";
 import { MidnightWalletProvider } from "./wallet-provider.js";
-import { waitForUnshieldedFunds } from "./wallet-utils.js";
+import { waitForShieldedToken, waitForUnshieldedFunds } from "./wallet-utils.js";
 
 (globalThis as { WebSocket?: unknown }).WebSocket = WebSocket;
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PKG_ROOT = resolve(__dirname, "..");
-const ZK_CONFIG_PATH = resolve(PKG_ROOT, "artifacts", "shielded-token", "ShieldedFungibleToken");
+const ZK_CONFIG_PATH = resolve(PKG_ROOT, "build", "VaultToken");
 const OUT_DIR = resolve(PKG_ROOT, "out");
 
 const GENESIS_SEED = "0000000000000000000000000000000000000000000000000000000000000001";
@@ -45,9 +43,7 @@ const logger = pino({
 
 const hexOf = (u8: Uint8Array): string => Buffer.from(u8).toString("hex");
 
-/** Walk the error `cause` chain and return the deepest message — the node's
- * RpcError (e.g. "1010: Invalid Transaction: Custom error: 186"), which the
- * generic top-level "Transaction submission error" otherwise hides. */
+/** Walk the error `cause` chain and return the deepest message (the node's RpcError). */
 const deepestCause = (e: unknown): string | undefined => {
 	let cur = e as { message?: unknown; cause?: unknown } | undefined;
 	let msg: string | undefined;
@@ -91,83 +87,85 @@ async function main(): Promise<void> {
 
 		const providers = configureProviders(walletProvider, ZK_CONFIG_PATH);
 
-		// Deploy contract A (the token to mint) and contract B (the recipient).
-		const tokenA = await ShieldedFungibleToken.deploy(
-			providers, "Token A", "TKA", ZK_CONFIG_PATH, logger,
-		);
-		const tokenB = await ShieldedFungibleToken.deploy(
-			providers, "Token B", "TKB", ZK_CONFIG_PATH, logger,
-		);
-		logger.info(`A (token)     : ${tokenA.addressHex}`);
-		logger.info(`B (recipient) : ${tokenB.addressHex}`);
+		// Deploy contract A (token / minter) and contract B (vault / recipient).
+		const tokenA = await VaultToken.deploy(providers, ZK_CONFIG_PATH, logger);
+		const vaultB = await VaultToken.deploy(providers, ZK_CONFIG_PATH, logger);
+		logger.info(`A (token)  : ${tokenA.addressHex}`);
+		logger.info(`B (vault)  : ${vaultB.addressHex}`);
 
-		// The experiment: mint A's token straight to contract B's address.
+		// 1) A mints token A to the wallet (mint to a coin public key — valid).
+		const minted = await tokenA.mint(walletProvider.getCoinPublicKey(), MINT_AMOUNT);
+		const colorHex = hexOf(minted.color);
+		await waitForShieldedToken(logger, walletProvider.wallet, colorHex, minted.value);
+
+		// 2) B receives that coin via receiveShielded — the step the failed
+		//    experiments lacked.
 		let passed = false;
-		let mintError: string | undefined;
+		let depositError: string | undefined;
 		let ledgerErr: string | undefined;
-		let mintedColor: string | undefined;
+		let depositTxHash: string | undefined;
 		try {
-			const minted = await tokenA.mintToContract(tokenB.addressHex, MINT_AMOUNT);
-			mintedColor = hexOf(minted.color);
+			depositTxHash = await vaultB.deposit(minted);
 			passed = true;
-			logger.info(`Mint-to-contract ACCEPTED: color=${mintedColor} value=${minted.value}`);
+			logger.info(`Deposit into B ACCEPTED: tx ${depositTxHash}`);
 		} catch (e) {
-			mintError = e instanceof Error ? (e.stack ?? e.message) : String(e);
+			depositError = e instanceof Error ? (e.stack ?? e.message) : String(e);
 			ledgerErr = deepestCause(e);
-			logger.error(`Mint-to-contract REJECTED: ${ledgerErr ?? (e instanceof Error ? e.message : String(e))}`);
+			logger.error(`Deposit into B REJECTED: ${ledgerErr ?? (e instanceof Error ? e.message : String(e))}`);
 		}
 
-		// Decode + persist every tx we managed to submit (deploy A, deploy B, mint?).
 		const txs = walletProvider.submittedTxs;
 		const decoded: (DecodedTx & { index: number; kind: string })[] = [];
 		for (const tx of txs) {
 			const d = { index: tx.index, kind: tx.kind, ...decodeTx(tx.hex) };
 			decoded.push(d);
-			// Annotate the rejected tx (the last one submitted on failure) with the
-			// node's verdict, since the decode itself only shows the tx bytes.
 			const banner =
 				!passed && ledgerErr && tx === txs[txs.length - 1]
 					? `=== SUBMISSION RESULT: REJECTED BY NODE ===\nledger error: ${ledgerErr}\n\n`
 					: "";
-			writeFileSync(resolve(OUT_DIR, `mtc-${tx.index}-${tx.kind}.hex`), tx.hex);
-			writeFileSync(resolve(OUT_DIR, `mtc-${tx.index}-${tx.kind}.decode.txt`), banner + formatDecode(d));
+			writeFileSync(resolve(OUT_DIR, `mad-${tx.index}-${tx.kind}.hex`), tx.hex);
+			writeFileSync(resolve(OUT_DIR, `mad-${tx.index}-${tx.kind}.decode.txt`), banner + formatDecode(d));
 		}
 
 		logger.info("==================================================================");
-		logger.info(`EXPERIMENT: mint token A -> recipient contract B  =>  ${passed ? "PASSED" : "FAILED"}`);
-		logger.info(`  A (token)     : ${tokenA.addressHex}`);
-		logger.info(`  B (recipient) : ${tokenB.addressHex}`);
-		if (mintedColor) logger.info(`  minted color  : ${mintedColor}`);
-		if (mintError) logger.info(`  reject reason : ${mintError.split("\n")[0]}`);
-		for (const tx of walletProvider.submittedTxs) {
-			logger.info(`  tx #${tx.index} ${tx.kind.padEnd(6)} ${tx.byteLength} bytes  ${tx.transactionHash}`);
+		logger.info(`EXPERIMENT: mint A -> wallet -> B.deposit(receiveShielded)  =>  ${passed ? "PASSED" : "FAILED"}`);
+		logger.info(`  A (token)  : ${tokenA.addressHex}`);
+		logger.info(`  B (vault)  : ${vaultB.addressHex}`);
+		logger.info(`  color      : ${colorHex}`);
+		if (depositTxHash) logger.info(`  deposit tx : ${depositTxHash}`);
+		if (ledgerErr) logger.info(`  reject     : ${ledgerErr}`);
+		for (const tx of txs) {
+			logger.info(`  tx #${tx.index} ${tx.kind.padEnd(7)} ${tx.byteLength} bytes  ${tx.transactionHash}`);
 		}
-		logger.info(`  raw hex + decodes (mtc-*) in: ${OUT_DIR}`);
+		logger.info(`  raw hex + decodes (mad-*) in: ${OUT_DIR}`);
 		logger.info("==================================================================");
 
 		writeFileSync(
-			resolve(OUT_DIR, "MINT-TO-CONTRACT.md"),
+			resolve(OUT_DIR, "MINT-AND-DEPOSIT.md"),
 			[
-				"# Experiment: mint token A -> recipient contract B",
+				"# Experiment: mint A -> wallet -> B.deposit (receiveShielded)",
 				"",
-				`Result: **${passed ? "PASSED" : "FAILED"}**${!passed && ledgerErr ? ` — node rejected with ledger error \`${ledgerErr}\`` : ""}.`,
+				`Result: **${passed ? "PASSED" : "FAILED"}**${!passed && ledgerErr ? ` — node rejected with ledger error \`${ledgerErr}\`` : " — contract B received token A."}`,
 				"",
-				`- contract A (token)     : \`${tokenA.addressHex}\``,
-				`- contract B (recipient) : \`${tokenB.addressHex}\``,
-				`- mint amount            : ${MINT_AMOUNT}`,
-				mintedColor ? `- minted color           : \`${mintedColor}\`` : "",
-				!passed && ledgerErr ? `- ledger error           : \`${ledgerErr}\`` : "",
-				mintError ? `\n## Reject reason (full stack)\n\n\`\`\`\n${mintError}\n\`\`\`` : "",
+				`- contract A (token) : \`${tokenA.addressHex}\``,
+				`- contract B (vault) : \`${vaultB.addressHex}\``,
+				`- token color        : \`${colorHex}\``,
+				`- mint amount        : ${MINT_AMOUNT}`,
+				depositTxHash ? `- deposit tx         : \`${depositTxHash}\`` : "",
+				!passed && ledgerErr ? `- ledger error       : \`${ledgerErr}\`` : "",
+				"",
+				passed
+					? "B.deposit ran `receiveShielded(coin)`, so the coin minted by A and held by the wallet is now in B's custody. This is the receive the mint-to-contract and mint-send-to-contract experiments lacked."
+					: "",
+				depositError ? `\n## Reject reason (full stack)\n\n\`\`\`\n${depositError}\n\`\`\`` : "",
 				"",
 				"## Transactions",
 				"",
-				...walletProvider.submittedTxs.map(
-					(tx) => `- #${tx.index} ${tx.kind} — ${tx.byteLength} bytes — \`${tx.transactionHash}\``,
-				),
+				...txs.map((tx) => `- #${tx.index} ${tx.kind} — ${tx.byteLength} bytes — \`${tx.transactionHash}\``),
 			].join("\n"),
 		);
 
-		if (!passed) throw new Error(`mint-to-contract failed: ${mintError?.split("\n")[0]}`);
+		if (!passed) throw new Error(`mint-and-deposit failed: ${ledgerErr ?? depositError?.split("\n")[0]}`);
 	} catch (e) {
 		logger.error(`Run failed: ${e instanceof Error ? e.message : String(e)}`);
 		if (e instanceof Error && e.stack) logger.error(e.stack);

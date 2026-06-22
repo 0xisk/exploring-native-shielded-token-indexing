@@ -1,19 +1,17 @@
-// Experiment: can contract A mint its shielded token directly to *contract B*?
+// Experiment (variant 2): mint a shielded token to a contract via
+// sendImmediateShielded, instead of via the mint recipient.
 //
-// Two ShieldedFungibleToken contracts are deployed on one local v8 stack:
-//   A — the token being minted
-//   B — the intended recipient (a contract address, not a wallet coin pk)
-// We then call A.mint() with the recipient Either selecting the ContractAddress
-// (right) variant set to B's address, and submit it. The question is purely
-// empirical: does the node ACCEPT a mint whose output coin is owned by a
-// contract that does not participate in the transaction (no `receiveShielded`)?
+// src/mint-to-contract.ts minted straight to a ContractAddress recipient and the
+// node rejected it. This variant asks whether the standard-library
+// `sendImmediateShielded` path makes any difference. Contract A (MintSendToken)
+// mints a coin to itself, then forwards it to contract B with
+// sendImmediateShielded. B (also a MintSendToken instance) is passive — it never
+// calls receiveShielded.
 //
-//   - if the mint tx is accepted -> EXPERIMENT PASSED (mint-to-contract works)
-//   - if it is rejected at build / prove / submit -> EXPERIMENT FAILED (+ reason)
+//   - mint+send accepted  -> EXPERIMENT PASSED
+//   - rejected at build / prove / submit -> EXPERIMENT FAILED (+ reason)
 //
-// Either way we capture and decode every tx so the raw bytes explain the result.
-//
-// Run: tsx src/mint-to-contract.ts   (or bash scripts/run-mint-to-contract.sh)
+// Run: tsx src/mint-send-to-contract.ts  (or bash scripts/run-mint-send-to-contract.sh)
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -22,8 +20,8 @@ import { setNetworkId } from "@midnight-ntwrk/midnight-js-network-id";
 import { getTestEnvironment, LocalTestConfiguration } from "@midnight-ntwrk/testkit-js";
 import { pino } from "pino";
 import { WebSocket } from "ws";
-import { ShieldedFungibleToken } from "./contract.js";
 import { type DecodedTx, decodeTx, formatDecode } from "./decode.js";
+import { MintSendToken } from "./mint-send-contract.js";
 import { configureProviders } from "./providers.js";
 import { MidnightWalletProvider } from "./wallet-provider.js";
 import { waitForUnshieldedFunds } from "./wallet-utils.js";
@@ -32,7 +30,7 @@ import { waitForUnshieldedFunds } from "./wallet-utils.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PKG_ROOT = resolve(__dirname, "..");
-const ZK_CONFIG_PATH = resolve(PKG_ROOT, "artifacts", "shielded-token", "ShieldedFungibleToken");
+const ZK_CONFIG_PATH = resolve(PKG_ROOT, "build", "MintSendToken");
 const OUT_DIR = resolve(PKG_ROOT, "out");
 
 const GENESIS_SEED = "0000000000000000000000000000000000000000000000000000000000000001";
@@ -43,11 +41,9 @@ const logger = pino({
 	transport: { target: "pino-pretty", options: { colorize: true, translateTime: "HH:MM:ss" } },
 });
 
-const hexOf = (u8: Uint8Array): string => Buffer.from(u8).toString("hex");
-
 /** Walk the error `cause` chain and return the deepest message — the node's
- * RpcError (e.g. "1010: Invalid Transaction: Custom error: 186"), which the
- * generic top-level "Transaction submission error" otherwise hides. */
+ * RpcError (e.g. "1010: Invalid Transaction: Custom error: 186"), which is what
+ * the generic top-level "Transaction submission error" hides. */
 const deepestCause = (e: unknown): string | undefined => {
 	let cur = e as { message?: unknown; cause?: unknown } | undefined;
 	let msg: string | undefined;
@@ -91,33 +87,28 @@ async function main(): Promise<void> {
 
 		const providers = configureProviders(walletProvider, ZK_CONFIG_PATH);
 
-		// Deploy contract A (the token to mint) and contract B (the recipient).
-		const tokenA = await ShieldedFungibleToken.deploy(
-			providers, "Token A", "TKA", ZK_CONFIG_PATH, logger,
-		);
-		const tokenB = await ShieldedFungibleToken.deploy(
-			providers, "Token B", "TKB", ZK_CONFIG_PATH, logger,
-		);
-		logger.info(`A (token)     : ${tokenA.addressHex}`);
+		// Deploy contract A (mints + sends) and contract B (passive recipient).
+		const tokenA = await MintSendToken.deploy(providers, ZK_CONFIG_PATH, logger);
+		const tokenB = await MintSendToken.deploy(providers, ZK_CONFIG_PATH, logger);
+		logger.info(`A (mint+send) : ${tokenA.addressHex}`);
 		logger.info(`B (recipient) : ${tokenB.addressHex}`);
 
-		// The experiment: mint A's token straight to contract B's address.
+		// The experiment: A mints to itself, then sendImmediateShielded -> B.
 		let passed = false;
 		let mintError: string | undefined;
 		let ledgerErr: string | undefined;
-		let mintedColor: string | undefined;
+		let sentValue: bigint | undefined;
 		try {
-			const minted = await tokenA.mintToContract(tokenB.addressHex, MINT_AMOUNT);
-			mintedColor = hexOf(minted.color);
+			const res = await tokenA.mintToContract(tokenB.addressHex, MINT_AMOUNT);
+			sentValue = res.sent.value;
 			passed = true;
-			logger.info(`Mint-to-contract ACCEPTED: color=${mintedColor} value=${minted.value}`);
+			logger.info(`Mint+send-to-contract ACCEPTED: sent=${sentValue}`);
 		} catch (e) {
 			mintError = e instanceof Error ? (e.stack ?? e.message) : String(e);
 			ledgerErr = deepestCause(e);
-			logger.error(`Mint-to-contract REJECTED: ${ledgerErr ?? (e instanceof Error ? e.message : String(e))}`);
+			logger.error(`Mint+send-to-contract REJECTED: ${ledgerErr ?? (e instanceof Error ? e.message : String(e))}`);
 		}
 
-		// Decode + persist every tx we managed to submit (deploy A, deploy B, mint?).
 		const txs = walletProvider.submittedTxs;
 		const decoded: (DecodedTx & { index: number; kind: string })[] = [];
 		for (const tx of txs) {
@@ -129,33 +120,33 @@ async function main(): Promise<void> {
 				!passed && ledgerErr && tx === txs[txs.length - 1]
 					? `=== SUBMISSION RESULT: REJECTED BY NODE ===\nledger error: ${ledgerErr}\n\n`
 					: "";
-			writeFileSync(resolve(OUT_DIR, `mtc-${tx.index}-${tx.kind}.hex`), tx.hex);
-			writeFileSync(resolve(OUT_DIR, `mtc-${tx.index}-${tx.kind}.decode.txt`), banner + formatDecode(d));
+			writeFileSync(resolve(OUT_DIR, `msc-${tx.index}-${tx.kind}.hex`), tx.hex);
+			writeFileSync(resolve(OUT_DIR, `msc-${tx.index}-${tx.kind}.decode.txt`), banner + formatDecode(d));
 		}
 
 		logger.info("==================================================================");
-		logger.info(`EXPERIMENT: mint token A -> recipient contract B  =>  ${passed ? "PASSED" : "FAILED"}`);
-		logger.info(`  A (token)     : ${tokenA.addressHex}`);
+		logger.info(`EXPERIMENT: mint A -> self -> sendImmediateShielded -> B  =>  ${passed ? "PASSED" : "FAILED"}`);
+		logger.info(`  A (mint+send) : ${tokenA.addressHex}`);
 		logger.info(`  B (recipient) : ${tokenB.addressHex}`);
-		if (mintedColor) logger.info(`  minted color  : ${mintedColor}`);
+		if (sentValue !== undefined) logger.info(`  sent value    : ${sentValue}`);
 		if (mintError) logger.info(`  reject reason : ${mintError.split("\n")[0]}`);
 		for (const tx of walletProvider.submittedTxs) {
 			logger.info(`  tx #${tx.index} ${tx.kind.padEnd(6)} ${tx.byteLength} bytes  ${tx.transactionHash}`);
 		}
-		logger.info(`  raw hex + decodes (mtc-*) in: ${OUT_DIR}`);
+		logger.info(`  raw hex + decodes (msc-*) in: ${OUT_DIR}`);
 		logger.info("==================================================================");
 
 		writeFileSync(
-			resolve(OUT_DIR, "MINT-TO-CONTRACT.md"),
+			resolve(OUT_DIR, "MINT-SEND-TO-CONTRACT.md"),
 			[
-				"# Experiment: mint token A -> recipient contract B",
+				"# Experiment: mint A -> self -> sendImmediateShielded -> recipient contract B",
 				"",
 				`Result: **${passed ? "PASSED" : "FAILED"}**${!passed && ledgerErr ? ` — node rejected with ledger error \`${ledgerErr}\`` : ""}.`,
 				"",
-				`- contract A (token)     : \`${tokenA.addressHex}\``,
+				`- contract A (mint+send) : \`${tokenA.addressHex}\``,
 				`- contract B (recipient) : \`${tokenB.addressHex}\``,
 				`- mint amount            : ${MINT_AMOUNT}`,
-				mintedColor ? `- minted color           : \`${mintedColor}\`` : "",
+				sentValue !== undefined ? `- sent value             : ${sentValue}` : "",
 				!passed && ledgerErr ? `- ledger error           : \`${ledgerErr}\`` : "",
 				mintError ? `\n## Reject reason (full stack)\n\n\`\`\`\n${mintError}\n\`\`\`` : "",
 				"",
@@ -167,7 +158,7 @@ async function main(): Promise<void> {
 			].join("\n"),
 		);
 
-		if (!passed) throw new Error(`mint-to-contract failed: ${mintError?.split("\n")[0]}`);
+		if (!passed) throw new Error(`mint-send-to-contract failed: ${mintError?.split("\n")[0]}`);
 	} catch (e) {
 		logger.error(`Run failed: ${e instanceof Error ? e.message : String(e)}`);
 		if (e instanceof Error && e.stack) logger.error(e.stack);

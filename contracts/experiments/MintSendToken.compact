@@ -1,0 +1,66 @@
+// Mint-then-send experiment (NOT part of the token; a probe harness).
+//
+// Question: does routing a minted coin to a contract through the
+// `sendImmediateShielded` standard-library circuit behave differently from
+// minting straight to a ContractAddress recipient (see src/mint-to-contract.ts,
+// which the node rejects)?
+//
+// `mintToContract` mints a coin to THIS contract (kernel.self()), then forwards
+// the freshly-minted, transaction-local coin to `recipient` (contract B) with
+// `sendImmediateShielded` — the send primitive documented for "coins created
+// within this transaction". B is a passive contract: it never calls
+// `receiveShielded`. Per the docs, `receiveShielded` "adds a validation
+// condition requiring this coin to be present as an output addressed to this
+// contract" — so the open question is whether the output to B is valid when B
+// does not receive it. The decode of the submitted tx is the answer.
+
+pragma language_version >= 0.23.0;
+import CompactStandardLibrary;
+
+// Public state (counter-free, like NoSupplyToken — no _totalSupply noise).
+export ledger _counter: Counter;
+export ledger _nonce: Bytes<32>;
+export sealed ledger _domain: Bytes<32>;
+export ledger _color: Bytes<32>;
+
+constructor(initNonce: Bytes<32>, domain_: Bytes<32>) {
+  _nonce = disclose(initNonce);
+  _domain = disclose(domain_);
+}
+
+circuit isZero(a: Bytes<32>): Boolean {
+  return a == pad(32, '');
+}
+
+export circuit color(): Bytes<32> {
+  return _color;
+}
+
+// Mint `amount` to this contract, then forward it to contract `recipient` via
+// sendImmediateShielded. Returns the send result (sent coin + any change).
+export circuit mintToContract(
+  recipient: ContractAddress,
+  amount: Uint<64>
+): ShieldedSendResult {
+  _counter.increment(1);
+  const newNonce = evolveNonce(_counter, _nonce);
+  _nonce = newNonce;
+
+  // 1) mint the coin to THIS contract (self).
+  const ret = mintShieldedToken(
+    _domain,
+    disclose(amount),
+    _nonce,
+    right<ZswapCoinPublicKey, ContractAddress>(kernel.self())
+  );
+  if (isZero(_color)) {
+    _color = ret.color;
+  }
+
+  // 2) forward the freshly-minted (transaction-local) coin to contract B.
+  return sendImmediateShielded(
+    ret,
+    right<ZswapCoinPublicKey, ContractAddress>(disclose(recipient)),
+    disclose(amount) as Uint<128>
+  );
+}
